@@ -1136,6 +1136,18 @@ namespace Gpu {
 				+ Symbols::title_left + Fx::b + Theme::c("title") + clock_speed_string + " MHz" + Fx::ub + Theme::c("div_line") + Symbols::title_right;
 		}
 
+		//? EMC shares the title line with the GPU clock. mem_clock is drawn only inside the VRAM block, which Tegra does not have.
+		if (gpu.supported_functions.emc_clock) {
+			const string emc_text = fmt::format("EMC {} MHz", gpu.emc_clock_speed);
+			const int badge = static_cast<int>(emc_text.size()) + 2;
+			const int right = gpu.supported_functions.gpu_clock ? 12 : 0;
+			const int start = b_width - right - badge;
+			if (start >= 2) {
+				out += Mv::to(b_y, b_x + start) + Theme::c("div_line") + Symbols::title_left
+					+ Fx::b + Theme::c("title") + emc_text + Fx::ub + Theme::c("div_line") + Symbols::title_right;
+			}
+		}
+
 		//? Power usage meter, power state
 		if (gpu.supported_functions.pwr_usage) {
 			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b + "PWR " + pwr_meter(safeVal(gpu.gpu_percent, "gpu-pwr-totals"s).back())
@@ -1143,6 +1155,89 @@ namespace Gpu {
 				+ fmt::format("{:>5.{}f}", gpu.pwr_usage / 1000.0, gpu.pwr_usage < 10'000 ? 2 : gpu.pwr_usage < 100'000 ? 1 : 0) + Theme::c("main_fg") + 'W';
 			if (gpu.supported_functions.pwr_state and gpu.pwr_state != 32) // NVML_PSTATE_UNKNOWN; unsupported or non-nvidia card
 				out += std::string(" P-state: ") + (gpu.pwr_state > 9 ? "" : " ") + 'P' + Theme::g("cached").at(clamp(gpu.pwr_state, 0ll, 100ll)) + to_string(gpu.pwr_state);
+			rows_used++;
+		}
+
+		//? Jetson status row. Label and value colors match GPU, PWR and the clock badges.
+		if (gpu.supported_functions.jetson_detail) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg");
+			int used = 0;
+			auto add = [&](const string& text, bool emphasized) {
+				const int gap = used == 0 ? 0 : 1;
+				if (used + gap + static_cast<int>(text.size()) > b_width - 2) return;
+				if (gap) out += Theme::c("div_line") + Symbols::v_line;
+				out += Theme::c(emphasized ? "title" : "inactive_fg") + text + Theme::c("main_fg");
+				used += gap + static_cast<int>(text.size());
+			};
+			if (gpu.gpu_clock_min > 0 and gpu.gpu_clock_max > 0
+					and (gpu.gpu_clock_min != gpu.gpu_clock_speed or gpu.gpu_clock_max != gpu.gpu_clock_speed))
+				add(fmt::format("{}-{}", gpu.gpu_clock_min, gpu.gpu_clock_max), true);
+			if (not gpu.gpu_governor.empty())
+				add(gpu.gpu_governor, true);
+			if (gpu.has_3d_scaling)
+				add(gpu.scaling_3d ? "3D on" : "3D off", gpu.scaling_3d);
+			add(gpu.railgate ? "rail on" : "rail off", gpu.railgate);
+			add(gpu.tpc_pg ? "TPC on" : "TPC off", gpu.tpc_pg);
+			if (not gpu.power_control.empty())
+				add(gpu.power_control, true);
+			rows_used++;
+		}
+
+		//? Fan duty and RPM. Same label weight as GPU and PWR.
+		if (gpu.supported_functions.jetson_fan and (gpu.fan_percent >= 0 or gpu.fan_rpm >= 0)) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg") + Fx::b + "FAN ";
+			if (gpu.fan_percent >= 0)
+				out += Theme::c("title") + fmt::format("{}%", gpu.fan_percent) + Theme::c("main_fg");
+			if (gpu.fan_rpm >= 0)
+				out += fmt::format(" {}rpm", gpu.fan_rpm);
+			out += Fx::ub;
+			rows_used++;
+		}
+
+		//? Jetson Clocks and NV Power share one row, split like ENC and DEC.
+		if ((gpu.supported_functions.jetson_clocks and not gpu.jetson_clocks_status.empty())
+				or (gpu.supported_functions.jetson_nvp and gpu.nv_power_id >= 0)) {
+			const bool show_clocks = gpu.supported_functions.jetson_clocks and not gpu.jetson_clocks_status.empty();
+			const bool show_nvp = gpu.supported_functions.jetson_nvp and gpu.nv_power_id >= 0;
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg");
+			if (show_clocks)
+				out += Fx::b + "Jetson Clocks " + Theme::c(gpu.jetson_clocks_status == "running" ? "title" : "inactive_fg")
+					+ gpu.jetson_clocks_status + Theme::c("main_fg");
+			if (show_clocks and show_nvp)
+				out += Theme::c("div_line") + Symbols::v_line + Theme::c("main_fg");
+			if (show_nvp) {
+				const string name = gpu.nv_power_name.empty() ? fmt::format("{}", gpu.nv_power_id) : gpu.nv_power_name;
+				out += Fx::b + "NVP " + Theme::c("title") + name + Fx::ub + Theme::c("main_fg");
+				if (not gpu.nv_power_name.empty())
+					out += Theme::c("inactive_fg") + fmt::format(" [{}]", gpu.nv_power_id) + Theme::c("main_fg");
+			}
+			out += Fx::ub;
+			rows_used++;
+		}
+
+		//? Accelerator clocks. Names use the same bold label weight as ENC and DEC.
+		if (gpu.supported_functions.jetson_engines and not gpu.engine_clocks.empty()) {
+			out += Mv::to(b_y + rows_used, b_x + 1) + Theme::c("main_fg");
+			int used = 0;
+			string token;
+			auto flush = [&]() {
+				if (token.empty()) return;
+				const int gap = used == 0 ? 0 : 1;
+				if (used + gap + static_cast<int>(token.size()) > b_width - 2) {
+					token.clear();
+					return;
+				}
+				const bool number = std::ranges::all_of(token, [](unsigned char c) { return c >= '0' and c <= '9'; });
+				if (gap) out += ' ';
+				out += (number ? Theme::c("title") : Fx::b) + token + (number ? Theme::c("main_fg") : Fx::ub);
+				used += gap + static_cast<int>(token.size());
+				token.clear();
+			};
+			for (char c : gpu.engine_clocks) {
+				if (c == ' ') flush();
+				else token += c;
+			}
+			flush();
 			rows_used++;
 		}
 
